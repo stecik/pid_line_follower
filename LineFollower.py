@@ -28,23 +28,26 @@ FREQ = 320  # servo frequency
 DURATION = 1 / FREQ  # sample duration in s
 SAMPLE_RATE = 40000  # sampling frequency
 # user correction of the difference in motor speed forward/backward
-CALIBRATION_LEFT = -3
+CALIBRATION_LEFT = -4
 CALIBRATION_RIGHT = 0
 # user correction of the USB_C converter (+-100%)
 DML = 0
 DMR = 0
 
 # PID configuration
-P_VAL = 6
-I_VAL = 0
-D_VAL = 0
-DEFAULT_SPEED = 10
+P_VAL = 8
+I_VAL = 0.1
+D_VAL = 10
+DEFAULT_SPEED = 15
 MAX_SPEED = 50
+
+# CAMERA configuration
+FLASH_MODE = 1  # 0 - off, 1 - on
 
 # ROBOT configuration
 BLACK_VAL = 4000000
 WHITE_VAL = 2000000
-OUT_OF_LINE_SPEED = 25
+OUT_OF_LINE_SPEED = 28
 USE_NO_SHADOWS = False
 
 
@@ -145,10 +148,12 @@ class PIDRegulator:
 
 class CameraController:
 
-    def __init__(self, image_widget) -> None:
+    def __init__(self, image_widget, flash_mode=FLASH_MODE) -> None:
         self._image_widget = image_widget
         self._line_detect_arr = np.zeros((8))
         self._cap = cv2.VideoCapture(0)
+        self._flash_mode = flash_mode
+        self._cap.set(cv2.CAP_PROP_ANDROID_FLASH_MODE, self._flash_mode)
 
         if not self._cap.isOpened():
             self._image_widget.source = "error.png"
