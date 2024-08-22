@@ -28,18 +28,20 @@ FREQ = 320  # servo frequency
 DURATION = 1 / FREQ  # sample duration in s
 SAMPLE_RATE = 40000  # sampling frequency
 # user correction of the difference in motor speed forward/backward
-CALIBRATION_LEFT = -4
-CALIBRATION_RIGHT = 0
+CALIBRATION_LEFT = 0
+CALIBRATION_RIGHT = -3
+M1_SPEED_CALIBR = 0
+M2_SPEED_CALIBR = 0
 # user correction of the USB_C converter (+-100%)
 DML = 0
 DMR = 0
 
 # PID configuration
-P_VAL = 8
-I_VAL = 0.1
-D_VAL = 10
-DEFAULT_SPEED = 15
-MAX_SPEED = 50
+P_VAL = 4
+I_VAL = 0.01
+D_VAL = 15
+DEFAULT_SPEED = 12
+MAX_SPEED = 70
 
 # CAMERA configuration
 FLASH_MODE = 1  # 0 - off, 1 - on
@@ -47,7 +49,9 @@ FLASH_MODE = 1  # 0 - off, 1 - on
 # ROBOT configuration
 BLACK_VAL = 4000000
 WHITE_VAL = 2000000
-OUT_OF_LINE_SPEED = 28
+JUNCTION_VAL = 20000000
+TURN_TIME = 1.5
+OUT_OF_LINE_SPEED = 25
 USE_NO_SHADOWS = False
 
 
@@ -80,6 +84,7 @@ class MotorController:
         self._sound = pygame.mixer.Sound(self._signal.tobytes())
 
     def set(self, motor_left, motor_right):
+        motor_left, motor_right = -motor_right, -motor_left
         # normailize values to range -10 to 10
         # to flip the servo direction remove the minus sign in front of int
         motor_left, motor_right = -int((motor_left + self._dml) / 5), -int(
@@ -273,6 +278,10 @@ class RobotController(Widget):
         self._default_speed = default_speed
         self._max_speed = max_speed
         self._use_no_shadows = use_no_shadows
+        self.junction = False
+        self.turning = False
+        self._turn_start_time = 0
+        self._turn_time = TURN_TIME
         Clock.schedule_once(self.start, 1)
 
     def start(self, dt):
@@ -303,6 +312,18 @@ class RobotController(Widget):
             return True
         return False
 
+    def _detect_junction(self, arr):
+        if sum(arr) > JUNCTION_VAL:
+            self.junction = True
+            self._camera_controller.add_text(
+                f"Junction Detected: {sum(arr)}", (30, 300)
+            )
+        else:
+            self.junction = False
+
+    def _turn_90_deg_right(self):
+        self._motors_controller.set(self._out_of_line_speed, -self._out_of_line_speed)
+
     def _back_to_line(self) -> float:
         err_old = self._pid_regulator.get_err_old()
         if err_old < 0:
@@ -329,19 +350,25 @@ class RobotController(Widget):
         return err
 
     def _set_motors(self, arr) -> None:
-        if self._out_of_line(arr):
-            self._back_to_line()
+        self._detect_junction(arr)
+        if self.junction:
+            self._turn_start_time = time.time()
+        if time.time() - self._turn_start_time < self._turn_time:
+            self._turn_90_deg_right()
         else:
-            err = self._compute_err(arr)
-            self._camera_controller.add_text(f"Error: {err}", (30, 150))
-            pid = self._pid_regulator.pid(err)
-            self._camera_controller.add_text(f"PID: {pid}", (30, 200))
-            m1 = self._default_speed + pid
-            m2 = self._default_speed - pid
-            m1 = self._set_constraints(m1)
-            m2 = self._set_constraints(m2)
-            self._motors_controller.set(m1, m2)
-            self._camera_controller.add_text(f"Motors: {m1 ,m2}", (30, 250))
+            if self._out_of_line(arr):
+                self._back_to_line()
+            else:
+                err = self._compute_err(arr)
+                self._camera_controller.add_text(f"Error: {err}", (30, 150))
+                pid = self._pid_regulator.pid(err)
+                self._camera_controller.add_text(f"PID: {pid}", (30, 200))
+                m1 = self._default_speed + pid
+                m2 = self._default_speed - pid
+                m1 = self._set_constraints(m1)
+                m2 = self._set_constraints(m2)
+                self._motors_controller.set(m1, m2)
+                self._camera_controller.add_text(f"Motors: {m1 ,m2}", (30, 250))
 
     def _set_constraints(self, value):
         if value < -self._max_speed:
