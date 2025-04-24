@@ -1,7 +1,12 @@
 import numpy as np
 import pygame
-import time
 import cv2
+import math
+import numpy as np
+import numpy.typing as npt
+import matplotlib.pyplot as plt
+import pygame
+from typing import Tuple
 from kivy.app import App
 from kivy.uix.widget import Widget
 from kivy.uix.image import Image
@@ -9,6 +14,7 @@ from kivy.clock import Clock
 from kivy.graphics.texture import Texture
 from kivy.lang import Builder
 
+# TODO: Stereo not working properly
 
 # Load the KV file
 Builder.load_string(
@@ -24,17 +30,13 @@ Builder.load_string(
 )
 
 # PWM configuration
-FREQ = 320  # servo frequency
-DURATION = 1 / FREQ  # sample duration in s
-SAMPLE_RATE = 40000  # sampling frequency
-# user correction of the difference in motor speed forward/backward
-CALIBRATION_LEFT = 0
-CALIBRATION_RIGHT = -3
-M1_SPEED_CALIBR = 0
-M2_SPEED_CALIBR = 0
-# user correction of the USB_C converter (+-100%)
-DML = 0
-DMR = 0
+SAMPLE_RATE = 40000
+SAMPLES = 250
+DURATION = 1 / SAMPLES
+INT16_MAX = np.iinfo(np.int16).max
+STOP = 60
+FRONT_RANGE = (55, 21)
+BACK_RANGE = (62, 96)
 
 # PID configuration
 P_VAL = 4
@@ -49,77 +51,151 @@ FLASH_MODE = 1  # 0 - off, 1 - on
 # ROBOT configuration
 BLACK_VAL = 4000000
 WHITE_VAL = 2000000
-JUNCTION_VAL = 20000000
-TURN_TIME = 1.5
 OUT_OF_LINE_SPEED = 25
 USE_NO_SHADOWS = False
+
+
+class PWM:
+
+    def __init__(
+        self,
+        samples: int = SAMPLES,
+        front_range: Tuple[int, int] = FRONT_RANGE,
+        back_range: Tuple[int, int] = BACK_RANGE,
+        stop: int = STOP,
+        curve_len: int = 10,
+    ):
+        self._samples = samples
+        self._int16_max = np.iinfo(np.int16).max
+        self._front_range = front_range
+        self._back_range = back_range
+        self._stop = stop
+        self._curve_len = curve_len
+
+    def _speed_to_samples(self, speed: int) -> int:
+        if speed == 0:
+            return self._stop
+        if speed > 0:
+            return self._range_to_samples(speed, self._front_range)
+        if speed < 0:
+            return self._range_to_samples(-speed, self._back_range)
+
+    def _range_to_samples(self, speed: int, sample_range, max_speed=100) -> int:
+        if speed > max_speed:
+            raise ValueError(f"Speed must be less than {max_speed}")
+
+        return int(
+            ((speed - 1) * (sample_range[1] - sample_range[0]) / (max_speed - 1))
+            + sample_range[0]
+        )
+
+    def _signal_mono(self, samples: int, polarity: int = 1) -> npt.NDArray[np.int16]:
+        self._validate_params(samples)
+        print(f"Samples: {samples}")
+
+        # length of the curve edge at the beginning and end of the signals
+        arr_len = self._samples // 2
+        signal_array = np.full(arr_len, polarity * self._int16_max, dtype=np.int16)
+        amplitude_start = (arr_len - samples) // 2
+        signal_array[0] = 0
+
+        # rising edge of the signal
+        start = 1
+        for i in range(start, amplitude_start):
+            signal_array[i] = (
+                polarity * 2.5 / (6 * (amplitude_start - i)) * self._int16_max
+            )
+
+        # curved edge of the signal
+        start = amplitude_start
+        end = amplitude_start + self._curve_len
+        for i in range(start, end):
+            sinus = amplitude_start - 1
+            angle = 1 + (i - sinus) * 6 / 100
+            signal_array[i] = polarity * int(math.sin(angle) * self._int16_max)
+
+        # copy the first half of the signal to the second half
+        signal_array[arr_len - end : arr_len] = signal_array[0:end][::-1]
+        return signal_array
+
+    def _signal_stereo(
+        self, samples1: int, samples2: int, polarity1: int, polarity2: int
+    ) -> npt.NDArray[np.int16]:
+        signal_array1 = self._signal_mono(samples1, polarity1)
+        signal_array2 = self._signal_mono(samples2, polarity2)
+        return np.vstack((signal_array1, signal_array2), dtype=np.int16)
+
+    def _validate_params(self, samples: int) -> None:
+        print(f"Samples: {samples}")
+        if samples < 1:
+            raise ValueError("Samples must be at least 1")
+        if samples > self._samples // 2 - (2 * self._curve_len):
+            raise ValueError(
+                f"Samples must be less than {self._samples // 2 - (2 * self._curve_len)}"
+            )
+
+    def visualize_signal(self, signal: npt.NDArray[np.int16]):
+        plt.figure(figsize=(8, 5))
+        plt.xlabel("Osa X")
+        plt.ylabel("Osa Y")
+        plt.legend()
+        plt.grid(True)
+        colors = ["b", "g"]
+        if signal.ndim > 1:
+            for i in range(len(signal)):
+                plt.plot(signal[i], linestyle="-", color=colors[i])
+        else:
+            plt.plot(signal, linestyle="-", color="b")
+        plt.show()
+
+    def get_signal(
+        self, left: int, right: int, channels: int = 2
+    ) -> npt.NDArray[np.int16]:
+        if channels not in (1, 2):
+            raise ValueError("Channels must be 1 or 2")
+
+        samples1 = self._speed_to_samples(left)
+        samples2 = self._speed_to_samples(right)
+
+        if channels == 1:
+            return np.concatenate(
+                (self._signal_mono(samples1, 1), self._signal_mono(samples2, -1))
+            )
+
+        if channels == 2:
+            samples1 = self._speed_to_samples(left)
+            samples2 = self._speed_to_samples(right)
+            return self._signal_stereo(samples1, samples2, 1, -1)
 
 
 class MotorController:
     def __init__(
         self,
-        frequency=FREQ,
-        duration=DURATION,
-        sample_rate=SAMPLE_RATE,
-        dml=DML,
-        dmr=DMR,
-        calibr_left=CALIBRATION_LEFT,
-        calibr_right=CALIBRATION_RIGHT,
+        pwm: PWM,
+        sample_rate: int = SAMPLE_RATE,
+        channels: int = 2,
+        max_speed: int = 100,
     ):
-        self._frequency = frequency
-        self._duration = duration
+        self._pwm = pwm
         self._sample_rate = sample_rate
-        self._dml = dml
-        self._dmr = dmr
-        self._signal = np.int16(np.zeros((int(self._sample_rate * self._duration) * 2)))
-        self._ml0 = 200
-        self._mr0 = 100
-        self._neutral_servo_val = 60
-        self._calibr_left = calibr_left
-        self._calibr_right = calibr_right
+        self._channels = channels
+        self._max_speed = max_speed
+        self._sound: pygame.mixer.Sound = None
 
-        # init sound
-        pygame.mixer.pre_init(frequency=self._sample_rate, channels=2, allowedchanges=1)
+        pygame.mixer.pre_init(frequency=self._sample_rate, channels=self._channels)
         pygame.mixer.init()
-        self._sound = pygame.mixer.Sound(self._signal.tobytes())
 
     def set(self, motor_left, motor_right):
-        motor_left, motor_right = -motor_right, -motor_left
-        # normailize values to range -10 to 10
-        # to flip the servo direction remove the minus sign in front of int
-        motor_left, motor_right = -int((motor_left + self._dml) / 5), -int(
-            (motor_right + self._dmr) / 5
-        )
-
-        motor_left = self._set_constraints(-20, 20, motor_left)
-        motor_right = self._set_constraints(-20, 20, motor_right)
-
-        # multiples of 0.025ms = 25us (mikroseconds)
-        # 40 - left   60 - stop   80 - right (1ms/1.5ms/2ms)
-        if motor_left != self._ml0 or motor_right != self._mr0:
-            duty_left = int(self._neutral_servo_val + self._calibr_left + motor_left)
-            duty_right = int(self._neutral_servo_val + self._calibr_right - motor_right)
-
-            # Generate signal for left channel
-            self._signal[0 : (2 * duty_left) : 2] = -32767
-            self._signal[(2 * duty_left) :: 2] = 32767
-
-            # Generate signal for right channel
-            self._signal[1 : (2 * duty_right + 1) : 2] = -32767
-            self._signal[(2 * duty_right + 1) :: 2] = 32767
-
+        motor_right = -motor_right
+        motor_left = max(-self._max_speed, min(motor_left, self._max_speed))
+        motor_right = max(-self._max_speed, min(motor_right, self._max_speed))
+        signal = self._pwm.get_signal(motor_left, motor_right, self._channels)
+        self._pwm.visualize_signal(signal)
+        if self._sound:
             self._sound.stop()
-            self._sound = pygame.mixer.Sound(self._signal.tobytes())
-            self._sound.play(-1)
-
-            self._ml0, self._mr0 = motor_left, motor_right
-
-    def _set_constraints(self, min_val, max_val, value):
-        if value < min_val:
-            return min_val
-        if value > max_val:
-            return max_val
-        return value
+        self._sound = pygame.mixer.Sound(signal.tobytes())
+        self._sound.play(-1)
+        pygame.time.delay(50)
 
 
 class PIDRegulator:
@@ -267,7 +343,8 @@ class RobotController(Widget):
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self._motors_controller = MotorController()
+        self._pwm = PWM()
+        self._motors_controller = MotorController(self._pwm, channels=1)
         self._pid_regulator = PIDRegulator()
         self._camera_controller = CameraController(self.ids.cam_display)
         self._weights = self._set_weights()
@@ -278,10 +355,6 @@ class RobotController(Widget):
         self._default_speed = default_speed
         self._max_speed = max_speed
         self._use_no_shadows = use_no_shadows
-        self.junction = False
-        self.turning = False
-        self._turn_start_time = 0
-        self._turn_time = TURN_TIME
         Clock.schedule_once(self.start, 1)
 
     def start(self, dt):
@@ -312,18 +385,6 @@ class RobotController(Widget):
             return True
         return False
 
-    def _detect_junction(self, arr):
-        if sum(arr) > JUNCTION_VAL:
-            self.junction = True
-            self._camera_controller.add_text(
-                f"Junction Detected: {sum(arr)}", (30, 300)
-            )
-        else:
-            self.junction = False
-
-    def _turn_90_deg_right(self):
-        self._motors_controller.set(self._out_of_line_speed, -self._out_of_line_speed)
-
     def _back_to_line(self) -> float:
         err_old = self._pid_regulator.get_err_old()
         if err_old < 0:
@@ -350,32 +411,17 @@ class RobotController(Widget):
         return err
 
     def _set_motors(self, arr) -> None:
-        self._detect_junction(arr)
-        if self.junction:
-            self._turn_start_time = time.time()
-        if time.time() - self._turn_start_time < self._turn_time:
-            self._turn_90_deg_right()
+        if self._out_of_line(arr):
+            self._back_to_line()
         else:
-            if self._out_of_line(arr):
-                self._back_to_line()
-            else:
-                err = self._compute_err(arr)
-                self._camera_controller.add_text(f"Error: {err}", (30, 150))
-                pid = self._pid_regulator.pid(err)
-                self._camera_controller.add_text(f"PID: {pid}", (30, 200))
-                m1 = self._default_speed + pid
-                m2 = self._default_speed - pid
-                m1 = self._set_constraints(m1)
-                m2 = self._set_constraints(m2)
-                self._motors_controller.set(m1, m2)
-                self._camera_controller.add_text(f"Motors: {m1 ,m2}", (30, 250))
-
-    def _set_constraints(self, value):
-        if value < -self._max_speed:
-            return -self._max_speed
-        if value > self._max_speed:
-            return self._max_speed
-        return value
+            err = self._compute_err(arr)
+            self._camera_controller.add_text(f"Error: {err}", (30, 150))
+            pid = self._pid_regulator.pid(err)
+            self._camera_controller.add_text(f"PID: {pid}", (30, 200))
+            m1 = self._default_speed + pid
+            m2 = self._default_speed - pid
+            self._motors_controller.set(m1, m2)
+            self._camera_controller.add_text(f"Motors: {m1 ,m2}", (30, 250))
 
 
 class LineFollower(App):
