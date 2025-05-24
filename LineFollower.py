@@ -13,6 +13,9 @@ from kivy.uix.image import Image
 from kivy.clock import Clock
 from kivy.graphics.texture import Texture
 from kivy.lang import Builder
+import threading
+from queue import Queue
+import queue
 
 # TODO: Stereo not working properly
 
@@ -28,7 +31,6 @@ Builder.load_string(
         pos: self.parent.pos
 """
 )
-
 # PWM configuration
 SAMPLE_RATE = 40000
 SAMPLES = 250
@@ -37,21 +39,26 @@ INT16_MAX = np.iinfo(np.int16).max
 STOP = 60
 FRONT_RANGE = (55, 21)
 BACK_RANGE = (62, 96)
+PYGAME_DELAY = 1
 
 # PID configuration
-P_VAL = 4
-I_VAL = 0.01
-D_VAL = 15
-DEFAULT_SPEED = 12
+P_VAL = 10
+I_VAL = 0.15
+D_VAL = 10
+DEFAULT_SPEED = 10
 MAX_SPEED = 70
 
 # CAMERA configuration
 FLASH_MODE = 1  # 0 - off, 1 - on
+RES_WIDTH = 1280
+RES_HEIGHT = 720
+
 
 # ROBOT configuration
 BLACK_VAL = 4000000
 WHITE_VAL = 2000000
-OUT_OF_LINE_SPEED = 25
+OUT_OF_LINE_CONDITION = True
+OUT_OF_LINE_SPEED = 15
 USE_NO_SHADOWS = False
 
 
@@ -175,11 +182,13 @@ class MotorController:
         sample_rate: int = SAMPLE_RATE,
         channels: int = 2,
         max_speed: int = 100,
+        pygame_delay: int = PYGAME_DELAY,
     ):
         self._pwm = pwm
         self._sample_rate = sample_rate
         self._channels = channels
         self._max_speed = max_speed
+        self._pygame_delay = pygame_delay
         self._sound: pygame.mixer.Sound = None
 
         pygame.mixer.pre_init(frequency=self._sample_rate, channels=self._channels)
@@ -190,12 +199,11 @@ class MotorController:
         motor_left = max(-self._max_speed, min(motor_left, self._max_speed))
         motor_right = max(-self._max_speed, min(motor_right, self._max_speed))
         signal = self._pwm.get_signal(motor_left, motor_right, self._channels)
-        self._pwm.visualize_signal(signal)
         if self._sound:
             self._sound.stop()
         self._sound = pygame.mixer.Sound(signal.tobytes())
         self._sound.play(-1)
-        pygame.time.delay(50)
+        pygame.time.delay(self._pygame_delay)
 
 
 class PIDRegulator:
@@ -232,23 +240,37 @@ class CameraController:
     def __init__(self, image_widget, flash_mode=FLASH_MODE) -> None:
         self._image_widget = image_widget
         self._line_detect_arr = np.zeros((8))
-        self._cap = cv2.VideoCapture(0)
+        self.frame_queue = Queue(maxsize=1)
+        self._cap = cv2.VideoCapture(0, cv2.CAP_ANDROID)
         self._flash_mode = flash_mode
         self._cap.set(cv2.CAP_PROP_ANDROID_FLASH_MODE, self._flash_mode)
 
         if not self._cap.isOpened():
             self._image_widget.source = "error.png"
         else:
-            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+            self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, RES_WIDTH)
+            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, RES_HEIGHT)
+            self._cap.set(cv2.CAP_PROP_FPS, 60)
+            threading.Thread(target=self._reader_thread, daemon=True).start()
 
         self._image_arr = None
         self._text_to_print = []
 
+    def _reader_thread(self):
+        while True:
+            ret, frame = self._cap.read()
+            if ret:
+                if self.frame_queue.full():
+                    _ = self.frame_queue.get_nowait()
+                self.frame_queue.put(frame)
+
     def refresh(self, dt):
-        return_status, frame = self._cap.read()
-        while not return_status:
-            return_status, frame = self._cap.read()
+        try:
+            frame = self.frame_queue.get_nowait()
+        except queue.Empty:
+            return
+        cv_image = self._process_frame(frame)
 
         cv_image = self._process_frame(frame)
         self._detect_lines(cv_image)
@@ -296,6 +318,7 @@ class CameraController:
             self._line_detect_arr[i] = square_sum
 
         self.add_text(f"Line detect: {self._line_detect_arr}", (30, 50))
+
 
     def _display_frame(self):
         self._print_all_text()
@@ -387,7 +410,7 @@ class RobotController(Widget):
 
     def _back_to_line(self) -> float:
         err_old = self._pid_regulator.get_err_old()
-        if err_old < 0:
+        if err_old > 0:
             self._motors_controller.set(
                 -self._out_of_line_speed, self._out_of_line_speed
             )
@@ -411,17 +434,19 @@ class RobotController(Widget):
         return err
 
     def _set_motors(self, arr) -> None:
-        if self._out_of_line(arr):
+        if self._out_of_line(arr) and OUT_OF_LINE_CONDITION:
             self._back_to_line()
         else:
             err = self._compute_err(arr)
             self._camera_controller.add_text(f"Error: {err}", (30, 150))
             pid = self._pid_regulator.pid(err)
             self._camera_controller.add_text(f"PID: {pid}", (30, 200))
-            m1 = self._default_speed + pid
-            m2 = self._default_speed - pid
-            self._motors_controller.set(m1, m2)
-            self._camera_controller.add_text(f"Motors: {m1 ,m2}", (30, 250))
+            m_right = self._default_speed - pid
+            m_left = self._default_speed + pid
+            self._motors_controller.set(m_right, m_left)
+            self._camera_controller.add_text(
+                f"Motors: L:{m_left} | R:{m_right}", (30, 250)
+            )
 
 
 class LineFollower(App):
