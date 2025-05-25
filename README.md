@@ -11,17 +11,6 @@ FREQ = 320  # servo frequency
 DURATION = 1 / FREQ  # sample duration in s
 SAMPLE_RATE = 40000  # sampling frequency
 ```
-
-
-### User correction of the difference in motor speed forward/backward
-```
-CALIBRATION_LEFT = -3
-CALIBRATION_RIGHT = 0
-```
-### Eser correction of the USB_C converter (+-100%)
-```
-DML = 0
-DMR = 0
 ```
 
 ### PID configuration
